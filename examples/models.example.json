@@ -1,0 +1,17 @@
+{
+  "providers": {
+    "zkapi": {
+      "baseUrl": "http://127.0.0.1:8787/v1",
+      "api": "openai-completions",
+      "apiKey": "$ZKAPI_PI_API_KEY",
+      "headers": {
+        "X-Anyone-Isolation": "$ANYONE_ISOLATION"
+      },
+      "models": [
+        {
+          "id": "anthropic/claude-haiku-5.5"
+        }
+      ]
+    }
+  }
+}

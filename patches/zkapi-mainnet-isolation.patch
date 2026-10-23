@@ -1,0 +1,144 @@
+diff --git a/zkapi-clientd/cmd/zkapi-clientd/main.go b/zkapi-clientd/cmd/zkapi-clientd/main.go
+index 37c2084..8508670 100644
+--- a/zkapi-clientd/cmd/zkapi-clientd/main.go
++++ b/zkapi-clientd/cmd/zkapi-clientd/main.go
+@@ -292,7 +292,8 @@ func serveSnapshot(ctx context.Context, dir string, c, expected config.Config, o
+ 	if err != nil {
+ 		return err
+ 	}
+-	api.RequireAPIKey = c.RequireAPIKey
++	api.RequireIsolation = strings.HasPrefix(c.RelayURL, "tor://")
++	api.RequireAPIKey = c.RequireAPIKey || api.RequireIsolation
+ 	api.Status = server.ServiceStatus{Backend: c.Backend}
+ 	api.Status.Network = c.ZKAPI.Network
+ 	api.Status.RequestBudgetPolicy = "model"
+diff --git a/zkapi-clientd/internal/relay/relay.go b/zkapi-clientd/internal/relay/relay.go
+index acebfc7..22014bd 100644
+--- a/zkapi-clientd/internal/relay/relay.go
++++ b/zkapi-clientd/internal/relay/relay.go
+@@ -57,13 +57,24 @@ func destinationDialer(relayURL string) (func(context.Context, string, string) (
+ 	if err != nil || u.User != nil || u.Fragment != "" || u.Hostname() == "" {
+ 		return nil, errors.New("transport must use wss or a loopback SOCKS5 proxy")
+ 	}
+-	if u.Scheme == "socks5" {
++	if u.Scheme == "socks5" || u.Scheme == "tor" {
+ 		ip := net.ParseIP(u.Hostname())
+ 		port, portErr := strconv.ParseUint(u.Port(), 10, 16)
+ 		if ip == nil || !ip.IsLoopback() || portErr != nil || port == 0 || u.Path != "" || u.RawQuery != "" || u.Opaque != "" {
+ 			return nil, errors.New("SOCKS5 proxy must be a numeric loopback address and port without credentials or path")
+ 		}
+ 		return func(ctx context.Context, network, address string) (net.Conn, error) {
++			if u.Scheme == "tor" {
++				identity, _ := ctx.Value(torIdentityKey{}).(string)
++				if identity == "" {
++					var err error
++					identity, err = NewTorIdentity()
++					if err != nil {
++						return nil, err
++					}
++				}
++				return dialSOCKS5Auth(ctx, u.Host, network, address, identity)
++			}
+ 			return dialSOCKS5(ctx, u.Host, network, address)
+ 		}, nil
+ 	}
+diff --git a/zkapi-clientd/internal/relay/socks5.go b/zkapi-clientd/internal/relay/socks5.go
+index 6182515..72e4531 100644
+--- a/zkapi-clientd/internal/relay/socks5.go
++++ b/zkapi-clientd/internal/relay/socks5.go
+@@ -13,6 +13,10 @@ import (
+ // dialSOCKS5 sends domain names to the proxy, so the local resolver never sees
+ // destination names. A failed proxy handshake never falls back to direct TCP.
+ func dialSOCKS5(ctx context.Context, proxyAddress, network, destination string) (net.Conn, error) {
++	return dialSOCKS5Auth(ctx, proxyAddress, network, destination, "")
++}
++
++func dialSOCKS5Auth(ctx context.Context, proxyAddress, network, destination, identity string) (net.Conn, error) {
+ 	if network != "tcp" {
+ 		return nil, errors.New("SOCKS5 requires TCP")
+ 	}
+@@ -50,12 +54,29 @@ func dialSOCKS5(ctx context.Context, proxyAddress, network, destination string)
+ 	if err := conn.SetDeadline(time.Now().Add(20 * time.Second)); err != nil {
+ 		return nil, err
+ 	}
+-	if _, err := io.Copy(conn, bytes.NewReader([]byte{5, 1, 0})); err != nil {
++	method := byte(0)
++	if identity != "" {
++		if len(identity) > 255 {
++			return nil, errors.New("invalid Tor isolation identity")
++		}
++		method = 2 // RFC 1929; never offer no-auth as a Tor fallback.
++	}
++	if _, err := io.Copy(conn, bytes.NewReader([]byte{5, 1, method})); err != nil {
+ 		return nil, errors.New("SOCKS5 greeting failed")
+ 	}
+ 	var reply [4]byte
+-	if _, err := io.ReadFull(conn, reply[:2]); err != nil || reply[0] != 5 || reply[1] != 0 {
+-		return nil, errors.New("SOCKS5 proxy rejected no-authentication method")
++	if _, err := io.ReadFull(conn, reply[:2]); err != nil || reply[0] != 5 || reply[1] != method {
++		return nil, errors.New("SOCKS5 proxy rejected required authentication method")
++	}
++	if method == 2 {
++		auth := append([]byte{1, byte(len(identity))}, []byte(identity)...)
++		auth = append(auth, 1, 'x')
++		if _, err := io.Copy(conn, bytes.NewReader(auth)); err != nil {
++			return nil, errors.New("Tor isolation authentication failed")
++		}
++		if _, err := io.ReadFull(conn, reply[:2]); err != nil || reply[0] != 1 || reply[1] != 0 {
++			return nil, errors.New("Tor isolation authentication rejected")
++		}
+ 	}
+ 	request := []byte{5, 1, 0, addressType}
+ 	if addressType == 3 {
+diff --git a/zkapi-clientd/internal/server/server.go b/zkapi-clientd/internal/server/server.go
+index 3c2117b..7d5e554 100644
+--- a/zkapi-clientd/internal/server/server.go
++++ b/zkapi-clientd/internal/server/server.go
+@@ -6,6 +6,7 @@ import (
+ 	"context"
+ 	"crypto/sha256"
+ 	"crypto/subtle"
++	"encoding/hex"
+ 	"encoding/json"
+ 	"errors"
+ 	"io"
+@@ -14,6 +15,8 @@ import (
+ 	"net/http"
+ 	"strings"
+ 	"time"
++
++	"github.com/ethereum/zkapi/zkapi-clientd/internal/relay"
+ )
+ 
+ type Backend interface {
+@@ -38,7 +41,8 @@ type API struct {
+ 	pending chan struct{}
+ 	// RequireAPIKey opts into bearer authentication for inference routes. Local
+ 	// management always requires its credentials, regardless of this setting.
+-	RequireAPIKey bool
++	RequireAPIKey    bool
++	RequireIsolation bool
+ 	// Admin is optional local wallet management. All of its routes require the
+ 	// private CLI credential; an inference API key cannot authorize wallet use.
+ 	Admin           http.Handler
+@@ -226,6 +230,20 @@ func (a *API) complete(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Minute)
+ 	defer cancel()
++
++	if a.RequireIsolation {
++		values := r.Header.Values("X-Anyone-Isolation")
++		if len(values) != 1 || len(values[0]) != 64 ||
++			values[0] != strings.ToLower(values[0]) {
++			writeError(w, 400, "isolation_required", "Valid conversation isolation identity required.")
++			return
++		}
++		if _, err := hex.DecodeString(values[0]); err != nil {
++			writeError(w, 400, "invalid_isolation", "Invalid conversation isolation identity.")
++			return
++		}
++		ctx = relay.WithTorIdentity(ctx, values[0])
++	}
+ 	// Bound total uploads and queued requests while allowing ordinary UI bursts
+ 	// to wait. Read the body before waiting so net/http can notice a disconnected
+ 	// client and cancel its queued request without spending anonymous access.
